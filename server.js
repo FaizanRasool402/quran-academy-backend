@@ -12,8 +12,8 @@ const PORT = process.env.PORT || 5000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:3000";
 const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB = process.env.MONGODB_DB || "quranacademy";
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "faizanrasooldeveloper@gmail.com";
-const EMAIL_USER = process.env.EMAIL_USER || "faizanrasooldeveloper@gmail.com";
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "aizaquranacademy@gmail.com";
+const EMAIL_USER = process.env.EMAIL_USER || "aizaquranacademy@gmail.com";
 const EMAIL_APP_PASSWORD = process.env.EMAIL_APP_PASSWORD;
 
 let contactsCollection;
