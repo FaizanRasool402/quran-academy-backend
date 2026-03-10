@@ -9,7 +9,7 @@ dotenv.config();
 const app = express();
 
 const PORT = process.env.PORT || 5000;
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:3000";
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://quranacademy-nine.vercel.app";
 const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB = process.env.MONGODB_DB || "quranacademy";
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "aizaquranacademy@gmail.com";
@@ -19,9 +19,17 @@ const EMAIL_APP_PASSWORD = process.env.EMAIL_APP_PASSWORD;
 let contactsCollection;
 let mailTransporter;
 
+// CORS - must be before all routes
+const allowedOrigins = [
+  "https://quranacademy-nine.vercel.app",
+  "http://localhost:3000",
+  CORS_ORIGIN,
+].filter((v, i, a) => a.indexOf(v) === i);
+
 app.use(
   cors({
-    origin: CLIENT_ORIGIN,
+    origin: allowedOrigins,
+    credentials: true,
   })
 );
 
