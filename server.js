@@ -23,6 +23,8 @@ let mailTransporter;
 const allowedOrigins = [
   "https://quranacademy-nine.vercel.app",
   "http://localhost:3000",
+  "https://aizaquranacademy.com",
+  "https://www.aizaquranacademy.com",
   CORS_ORIGIN,
 ].filter((v, i, a) => a.indexOf(v) === i);
 
