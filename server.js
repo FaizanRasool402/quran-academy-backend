@@ -1,10 +1,24 @@
 const express = require("express");
+const path = require("path");
+const fs = require("fs");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const nodemailer = require("nodemailer");
-const { MongoClient } = require("mongodb");
+const multer = require("multer");
+const { MongoClient, ObjectId } = require("mongodb");
+const dns = require("dns");
 
 dotenv.config();
+
+// Bohat dafa local PC / ISP ka DNS mongodb+srv resolve nahi karta (ESERVFAIL).
+// Google DNS se Node ki DNS lookups theek ho jati hain — is liye pehle yeh set karte hain.
+if (process.env.MONGODB_SKIP_GOOGLE_DNS !== "1") {
+  try {
+    dns.setServers(["8.8.8.8", "8.8.4.4", "1.1.1.1"]);
+  } catch {
+    /* ignore */
+  }
+}
 
 const app = express();
 
@@ -16,8 +30,68 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "aizaquranacademy@gmail.com";
 const EMAIL_USER = process.env.EMAIL_USER || "aizaquranacademy@gmail.com";
 const EMAIL_APP_PASSWORD = process.env.EMAIL_APP_PASSWORD;
 
+let mongoClient = null;
 let contactsCollection;
+let blogsCollection;
 let mailTransporter;
+
+/** Har dafa jab DB chahiye ho — pehli baar fail ho to dubara try ho sakta hai (DNS / net theek hone par). */
+async function connectMongo() {
+  if (!MONGODB_URI) {
+    return false;
+  }
+  if (blogsCollection && mongoClient) {
+    return true;
+  }
+  try {
+    if (mongoClient) {
+      try {
+        await mongoClient.close();
+      } catch {
+        /* ignore */
+      }
+      mongoClient = null;
+    }
+    contactsCollection = null;
+    blogsCollection = null;
+
+    mongoClient = new MongoClient(MONGODB_URI, {
+      serverSelectionTimeoutMS: 15_000,
+    });
+    await mongoClient.connect();
+    const db = mongoClient.db(MONGODB_DB);
+    contactsCollection = db.collection("contacts");
+    blogsCollection = db.collection("blog_posts");
+    console.log("Connected to MongoDB:", MONGODB_DB);
+    return true;
+  } catch (err) {
+    console.error("MongoDB connect failed:", err?.message || err);
+    mongoClient = null;
+    contactsCollection = null;
+    blogsCollection = null;
+    return false;
+  }
+}
+
+const blogUploadDir = path.join(__dirname, "uploads", "blog-images");
+fs.mkdirSync(blogUploadDir, { recursive: true });
+
+const blogStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, blogUploadDir),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || "") || ".jpg";
+    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}${ext}`);
+  },
+});
+
+const blogUpload = multer({
+  storage: blogStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = /^image\/(jpeg|jpg|png|webp)$/i.test(file.mimetype);
+    cb(ok ? null : new Error("Only JPEG, PNG or WebP images are allowed."), ok);
+  },
+});
 
 // CORS - must be before all routes
 const allowedOrigins = [
@@ -36,6 +110,7 @@ app.use(
 );
 
 app.use(express.json());
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 app.get("/", (req, res) => {
   res.json({ ok: true, message: "Quran Academy backend is running" });
@@ -80,6 +155,7 @@ app.post("/api/contact", async (req, res) => {
       createdAt: new Date(),
     };
 
+    await connectMongo();
     if (contactsCollection) {
       await contactsCollection.insertOne(doc);
     } else {
@@ -110,6 +186,208 @@ app.post("/api/contact", async (req, res) => {
   }
 });
 
+app.post("/api/blogs", (req, res, next) => {
+  blogUpload.single("featuredImage")(req, res, (err) => {
+    if (err) {
+      const msg = err.message || "Image upload failed";
+      return res.status(400).json({ error: msg });
+    }
+    next();
+  });
+}, async (req, res) => {
+  try {
+    const dbOk = await connectMongo();
+    if (!dbOk || !blogsCollection) {
+      return res.status(503).json({
+        error:
+          "Database not available. MongoDB connect nahi ho raha — .env me MONGODB_URI sahi lagao, internet check karo, ya Atlas se Standard (mongodb://) string use karo. Backend terminal ki error bhi dekho.",
+      });
+    }
+
+    const mainHeading = (req.body.mainHeading || "").trim();
+    if (!mainHeading) {
+      return res.status(400).json({ error: "Main heading is required." });
+    }
+
+    const heading2First = (req.body.heading2First || "").trim();
+    const paragraphFirst = (req.body.paragraphFirst || "").trim();
+    const heading2Second = (req.body.heading2Second || "").trim();
+    const paragraphSecond = (req.body.paragraphSecond || "").trim();
+
+    const imageUrl = req.file ? `/uploads/blog-images/${req.file.filename}` : null;
+
+    const doc = {
+      mainHeading,
+      heading2First,
+      paragraphFirst,
+      heading2Second,
+      paragraphSecond,
+      imageUrl,
+      published: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await blogsCollection.insertOne(doc);
+    return res.json({ success: true, id: result.insertedId.toString(), imageUrl });
+  } catch (err) {
+    console.error("Blog save error:", err);
+    return res.status(500).json({ error: "Failed to save blog." });
+  }
+});
+
+app.get("/api/blogs", async (req, res) => {
+  try {
+    const dbOk = await connectMongo();
+    if (!dbOk || !blogsCollection) {
+      return res.status(503).json({
+        error:
+          "Database not available. MongoDB connect nahi ho raha — pehle backend terminal me connection error fix karo.",
+      });
+    }
+    const list = await blogsCollection.find({}).sort({ createdAt: -1 }).toArray();
+    const out = list.map((b) => ({
+      id: b._id.toString(),
+      mainHeading: b.mainHeading,
+      imageUrl: b.imageUrl || null,
+      published: !!b.published,
+      createdAt: b.createdAt,
+    }));
+    return res.json(out);
+  } catch (err) {
+    console.error("Blog list error:", err);
+    return res.status(500).json({ error: "Failed to load blogs." });
+  }
+});
+
+app.patch("/api/blogs/:id/publish", async (req, res) => {
+  try {
+    const dbOk = await connectMongo();
+    if (!dbOk || !blogsCollection) {
+      return res.status(503).json({ error: "Database not available." });
+    }
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid blog id." });
+    }
+    const r = await blogsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { published: true, updatedAt: new Date() } }
+    );
+    if (r.matchedCount === 0) {
+      return res.status(404).json({ error: "Blog not found." });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Blog publish error:", err);
+    return res.status(500).json({ error: "Failed to publish." });
+  }
+});
+
+app.delete("/api/blogs/:id", async (req, res) => {
+  try {
+    const dbOk = await connectMongo();
+    if (!dbOk || !blogsCollection) {
+      return res.status(503).json({ error: "Database not available." });
+    }
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid blog id." });
+    }
+    const blog = await blogsCollection.findOne({ _id: new ObjectId(id) });
+    if (!blog) {
+      return res.status(404).json({ error: "Blog not found." });
+    }
+    if (blog.imageUrl && typeof blog.imageUrl === "string") {
+      const base = path.basename(blog.imageUrl);
+      const fp = path.join(blogUploadDir, base);
+      try {
+        await fs.promises.unlink(fp);
+      } catch {
+        /* file may already be gone */
+      }
+    }
+    await blogsCollection.deleteOne({ _id: new ObjectId(id) });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Blog delete error:", err);
+    return res.status(500).json({ error: "Failed to delete blog." });
+  }
+});
+
+function buildPublicExcerpt(b) {
+  const parts = [b.paragraphFirst, b.paragraphSecond, b.heading2First, b.heading2Second]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!parts) return b.mainHeading || "";
+  return parts.length > 200 ? `${parts.slice(0, 197)}…` : parts;
+}
+
+function estimateReadTimeFromBlog(b) {
+  const text = [b.mainHeading, b.paragraphFirst, b.paragraphSecond, b.heading2First, b.heading2Second]
+    .filter(Boolean)
+    .join(" ");
+  const words = text.split(/\s+/).filter(Boolean).length;
+  const mins = Math.max(1, Math.ceil(words / 200));
+  return `${mins} min read`;
+}
+
+/** Website / Blog.tsx — sirf published posts */
+app.get("/api/public/blogs", async (req, res) => {
+  try {
+    const dbOk = await connectMongo();
+    if (!dbOk || !blogsCollection) {
+      return res.json([]);
+    }
+    const list = await blogsCollection.find({ published: true }).sort({ createdAt: -1 }).toArray();
+    const out = list.map((b) => ({
+      id: b._id.toString(),
+      title: b.mainHeading,
+      excerpt: buildPublicExcerpt(b),
+      imageUrl: b.imageUrl || null,
+      createdAt: b.createdAt,
+      readTime: estimateReadTimeFromBlog(b),
+    }));
+    return res.json(out);
+  } catch (err) {
+    console.error("Public blogs list error:", err);
+    return res.status(500).json({ error: "Failed to load blogs." });
+  }
+});
+
+/** Single published post (public detail page) */
+app.get("/api/public/blogs/:id", async (req, res) => {
+  try {
+    const dbOk = await connectMongo();
+    if (!dbOk || !blogsCollection) {
+      return res.status(503).json({ error: "Database not available." });
+    }
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid id." });
+    }
+    const b = await blogsCollection.findOne({ _id: new ObjectId(id), published: true });
+    if (!b) {
+      return res.status(404).json({ error: "Not found." });
+    }
+    return res.json({
+      id: b._id.toString(),
+      mainHeading: b.mainHeading,
+      heading2First: b.heading2First || "",
+      paragraphFirst: b.paragraphFirst || "",
+      heading2Second: b.heading2Second || "",
+      paragraphSecond: b.paragraphSecond || "",
+      imageUrl: b.imageUrl || null,
+      createdAt: b.createdAt,
+    });
+  } catch (err) {
+    console.error("Public blog get error:", err);
+    return res.status(500).json({ error: "Failed to load blog." });
+  }
+});
+
 async function start() {
   if (EMAIL_APP_PASSWORD) {
     mailTransporter = nodemailer.createTransport({
@@ -129,14 +407,15 @@ async function start() {
   if (!MONGODB_URI) {
     console.warn("MONGODB_URI not set, running without database connection.");
   } else {
-    try {
-      const client = new MongoClient(MONGODB_URI);
-      await client.connect();
-      const db = client.db(MONGODB_DB);
-      contactsCollection = db.collection("contacts");
-      console.log("Connected to MongoDB:", MONGODB_DB);
-    } catch (err) {
-      console.error("Failed to connect to MongoDB, continuing without DB:", err);
+    const ok = await connectMongo();
+    if (!ok) {
+      console.error(
+        "\n--- Pehli dafa MongoDB connect fail — jab blog add karoge tab dubara try hoga. Fix ke liye: ---\n" +
+          "1) Internet / Wi-Fi, VPN band.\n" +
+          "2) ipconfig /flushdns\n" +
+          "3) Atlas se Standard connection string (mongodb://...) .env me MONGODB_URI me.\n" +
+          "4) Atlas → Network Access → IP allow (0.0.0.0/0 ya apna IP).\n"
+      );
     }
   }
 
