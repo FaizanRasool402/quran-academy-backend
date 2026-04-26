@@ -1,6 +1,7 @@
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const nodemailer = require("nodemailer");
@@ -73,16 +74,35 @@ async function connectMongo() {
   }
 }
 
-const blogUploadDir = path.join(__dirname, "uploads", "blog-images");
-fs.mkdirSync(blogUploadDir, { recursive: true });
+let blogUploadDir = path.join(__dirname, "uploads", "blog-images");
+let useDiskStorage = true;
 
-const blogStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, blogUploadDir),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || "") || ".jpg";
-    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}${ext}`);
-  },
-});
+try {
+  fs.mkdirSync(blogUploadDir, { recursive: true });
+  const writeProbePath = path.join(blogUploadDir, ".write-test");
+  fs.writeFileSync(writeProbePath, "ok");
+  fs.unlinkSync(writeProbePath);
+} catch {
+  // Read-only/serverless filesystems cannot write under /var/task.
+  // Fall back to in-memory uploads and save data URLs in MongoDB.
+  useDiskStorage = false;
+  blogUploadDir = path.join(os.tmpdir(), "blog-images");
+  try {
+    fs.mkdirSync(blogUploadDir, { recursive: true });
+  } catch {
+    /* ignore */
+  }
+}
+
+const blogStorage = useDiskStorage
+  ? multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, blogUploadDir),
+      filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname || "") || ".jpg";
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}${ext}`);
+      },
+    })
+  : multer.memoryStorage();
 
 const blogUpload = multer({
   storage: blogStorage,
@@ -230,7 +250,14 @@ app.post("/api/blogs", (req, res, next) => {
       }
     }
 
-    const imageUrl = req.file ? `/uploads/blog-images/${req.file.filename}` : null;
+    let imageUrl = null;
+    if (req.file) {
+      if (useDiskStorage && req.file.filename) {
+        imageUrl = `/uploads/blog-images/${req.file.filename}`;
+      } else if (req.file.buffer) {
+        imageUrl = `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}`;
+      }
+    }
 
     const doc = {
       mainHeading,
@@ -314,7 +341,7 @@ app.delete("/api/blogs/:id", async (req, res) => {
     if (!blog) {
       return res.status(404).json({ error: "Blog not found." });
     }
-    if (blog.imageUrl && typeof blog.imageUrl === "string") {
+    if (useDiskStorage && blog.imageUrl && typeof blog.imageUrl === "string" && !blog.imageUrl.startsWith("data:")) {
       const base = path.basename(blog.imageUrl);
       const fp = path.join(blogUploadDir, base);
       try {
