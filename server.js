@@ -209,19 +209,35 @@ app.post("/api/blogs", (req, res, next) => {
       return res.status(400).json({ error: "Main heading is required." });
     }
 
-    const heading2First = (req.body.heading2First || "").trim();
-    const paragraphFirst = (req.body.paragraphFirst || "").trim();
-    const heading2Second = (req.body.heading2Second || "").trim();
-    const paragraphSecond = (req.body.paragraphSecond || "").trim();
+    const introContent = (req.body.introContent || "").trim();
+    const conclusion = (req.body.conclusion || "").trim();
+    const imageAltText = (req.body.imageAltText || "").trim();
+    let subheadings = [];
+    if (req.body.subheadings) {
+      try {
+        const parsed = JSON.parse(req.body.subheadings);
+        if (Array.isArray(parsed)) {
+          subheadings = parsed
+            .slice(0, 10)
+            .map((item) => ({
+              title: String(item?.title || "").trim(),
+              content: String(item?.content || "").trim(),
+            }))
+            .filter((item) => item.title || item.content);
+        }
+      } catch {
+        subheadings = [];
+      }
+    }
 
     const imageUrl = req.file ? `/uploads/blog-images/${req.file.filename}` : null;
 
     const doc = {
       mainHeading,
-      heading2First,
-      paragraphFirst,
-      heading2Second,
-      paragraphSecond,
+      introContent,
+      subheadings,
+      conclusion,
+      imageAltText,
       imageUrl,
       published: false,
       createdAt: new Date(),
@@ -316,7 +332,15 @@ app.delete("/api/blogs/:id", async (req, res) => {
 });
 
 function buildPublicExcerpt(b) {
-  const parts = [b.paragraphFirst, b.paragraphSecond, b.heading2First, b.heading2Second]
+  const legacyText = [b.paragraphFirst, b.paragraphSecond, b.heading2First, b.heading2Second]
+    .filter(Boolean)
+    .join(" ");
+  const subheadingText = Array.isArray(b.subheadings)
+    ? b.subheadings
+        .map((item) => `${item?.title || ""} ${item?.content || ""}`)
+        .join(" ")
+    : "";
+  const parts = [b.introContent, subheadingText, b.conclusion, legacyText]
     .filter(Boolean)
     .join(" ")
     .replace(/\s+/g, " ")
@@ -326,7 +350,15 @@ function buildPublicExcerpt(b) {
 }
 
 function estimateReadTimeFromBlog(b) {
-  const text = [b.mainHeading, b.paragraphFirst, b.paragraphSecond, b.heading2First, b.heading2Second]
+  const legacyText = [b.paragraphFirst, b.paragraphSecond, b.heading2First, b.heading2Second]
+    .filter(Boolean)
+    .join(" ");
+  const subheadingText = Array.isArray(b.subheadings)
+    ? b.subheadings
+        .map((item) => `${item?.title || ""} ${item?.content || ""}`)
+        .join(" ")
+    : "";
+  const text = [b.mainHeading, b.introContent, subheadingText, b.conclusion, legacyText]
     .filter(Boolean)
     .join(" ");
   const words = text.split(/\s+/).filter(Boolean).length;
@@ -372,13 +404,26 @@ app.get("/api/public/blogs/:id", async (req, res) => {
     if (!b) {
       return res.status(404).json({ error: "Not found." });
     }
+    const fallbackSubheadings = [
+      { title: b.heading2First || "", content: b.paragraphFirst || "" },
+      { title: b.heading2Second || "", content: b.paragraphSecond || "" },
+    ].filter((item) => item.title || item.content);
+
     return res.json({
       id: b._id.toString(),
       mainHeading: b.mainHeading,
-      heading2First: b.heading2First || "",
-      paragraphFirst: b.paragraphFirst || "",
-      heading2Second: b.heading2Second || "",
-      paragraphSecond: b.paragraphSecond || "",
+      introContent: b.introContent || b.paragraphFirst || "",
+      subheadings: Array.isArray(b.subheadings)
+        ? b.subheadings
+            .slice(0, 10)
+            .map((item) => ({
+              title: String(item?.title || ""),
+              content: String(item?.content || ""),
+            }))
+            .filter((item) => item.title || item.content)
+        : fallbackSubheadings,
+      conclusion: b.conclusion || b.paragraphSecond || "",
+      imageAltText: b.imageAltText || "",
       imageUrl: b.imageUrl || null,
       createdAt: b.createdAt,
     });
