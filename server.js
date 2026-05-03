@@ -56,19 +56,20 @@ async function connectMongo() {
     blogsCollection = null;
 
     mongoClient = new MongoClient(MONGODB_URI, {
-      serverSelectionTimeoutMS: 15_000,
+      serverSelectionTimeoutMS: 10_000,
+      maxPoolSize: 10,
     });
     await mongoClient.connect();
     const db = mongoClient.db(MONGODB_DB);
     contactsCollection = db.collection("contacts");
     blogsCollection = db.collection("blog_posts");
-    try {
-      // Query: { published: true }.sort({ createdAt: -1 }) — yahi index use hota hai.
-      // (Aap ne jo `db.blogs` + `status` likha: yahan collection `blog_posts`, field `published` hai.)
-      await blogsCollection.createIndex({ published: 1, createdAt: -1 }, { background: true });
-    } catch (idxErr) {
-      console.warn("blog_posts index ensure:", idxErr?.message || idxErr);
-    }
+    // Index alag tick pe — pehla request jaldi; list query phir bhi chalti hai bina index ke
+    setImmediate(() => {
+      if (!blogsCollection) return;
+      blogsCollection
+        .createIndex({ published: 1, createdAt: -1 }, { background: true })
+        .catch((idxErr) => console.warn("blog_posts index ensure:", idxErr?.message || idxErr));
+    });
     console.log("Connected to MongoDB:", MONGODB_DB);
     return true;
   } catch (err) {
@@ -132,7 +133,7 @@ const corsOptions = {
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error("CORS not allowed"));
+      callback(null, false);
     }
   },
   credentials: true,
@@ -492,34 +493,36 @@ async function start() {
       service: "gmail",
       auth: { user: EMAIL_USER, pass: EMAIL_APP_PASSWORD },
     });
-    try {
-      await mailTransporter.verify();
-      console.log("Email configured and verified for:", ADMIN_EMAIL);
-    } catch (verifyErr) {
-      console.error("Email verify failed (check App Password):", verifyErr.message);
-    }
+    setImmediate(async () => {
+      try {
+        await mailTransporter.verify();
+        console.log("Email configured and verified for:", ADMIN_EMAIL);
+      } catch (verifyErr) {
+        console.error("Email verify failed (check App Password):", verifyErr.message);
+      }
+    });
   } else {
     console.warn("EMAIL_APP_PASSWORD not set, email notifications disabled.");
   }
 
-  if (!MONGODB_URI) {
-    console.warn("MONGODB_URI not set, running without database connection.");
-  } else {
-    const ok = await connectMongo();
-    if (!ok) {
-      console.error(
-        "\n--- Pehli dafa MongoDB connect fail — jab blog add karoge tab dubara try hoga. Fix ke liye: ---\n" +
-          "1) Internet / Wi-Fi, VPN band.\n" +
-          "2) ipconfig /flushdns\n" +
-          "3) Atlas se Standard connection string (mongodb://...) .env me MONGODB_URI me.\n" +
-          "4) Atlas → Network Access → IP allow (0.0.0.0/0 ya apna IP).\n"
-      );
-    }
-  }
-
+  /** Pehle port bind — Hostinger/nginx timeout / "Failed to fetch" se bacho (Mongo await mat karo). */
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
   });
+
+  if (!MONGODB_URI) {
+    console.warn("MONGODB_URI not set, running without database connection.");
+  } else {
+    setImmediate(() => {
+      connectMongo().then((ok) => {
+        if (!ok) {
+          console.error(
+            "Initial MongoDB connect failed — API routes will retry. Check MONGODB_URI, Atlas IPs, DNS."
+          );
+        }
+      });
+    });
+  }
 }
 
 start();
