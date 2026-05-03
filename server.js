@@ -23,7 +23,7 @@ if (process.env.MONGODB_SKIP_GOOGLE_DNS !== "1") {
 
 const app = express();
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://quranacademy-nine.vercel.app";
 /** Comma-separated extra origins (e.g. Hostinger frontend: https://mysite.hostingersite.com). */
 const CORS_ORIGINS_EXTRA = (process.env.CORS_ORIGINS || "")
@@ -516,8 +516,8 @@ async function start() {
     }
   }
 
-  app.listen(PORT, () => {
-    console.log(`Backend server listening on http://localhost:${PORT}`);
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
   });
 }
 
