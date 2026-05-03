@@ -393,23 +393,74 @@ function estimateReadTimeFromBlog(b) {
   return `${mins} min read`;
 }
 
-/** Website / Blog.tsx — sirf published posts */
+/** List view: HTML strip + short excerpt (full body mat load karo). */
+function stripHtmlForList(s) {
+  return String(s || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildListCardExcerpt(b) {
+  const intro = stripHtmlForList(b.introContent || b.paragraphFirst || "");
+  if (intro.length >= 30) {
+    return intro.length > 200 ? `${intro.slice(0, 197)}…` : intro;
+  }
+  const title = stripHtmlForList(b.mainHeading || "");
+  return title.length > 200 ? `${title.slice(0, 197)}…` : title || "";
+}
+
+function estimateReadTimeFromListFields(b) {
+  const intro = stripHtmlForList(b.introContent || b.paragraphFirst || "").slice(0, 4000);
+  const text = [b.mainHeading, intro].filter(Boolean).join(" ");
+  const words = text.split(/\s+/).filter(Boolean).length;
+  const mins = Math.max(1, Math.ceil(words / 200));
+  return `${mins} min read`;
+}
+
+/** Website / Blog.tsx — sirf published posts (projection + pagination = fast) */
 app.get("/api/public/blogs", async (req, res) => {
   try {
     const dbOk = await connectMongo();
+    const pageSize = Math.min(50, Math.max(1, parseInt(String(req.query.limit || "9"), 10) || 9));
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const skip = (page - 1) * pageSize;
+
     if (!dbOk || !blogsCollection) {
-      return res.json([]);
+      return res.json({ items: [], total: 0, page, pageSize, hasMore: false });
     }
-    const list = await blogsCollection.find({ published: true }).sort({ createdAt: -1 }).toArray();
-    const out = list.map((b) => ({
+
+    const filter = { published: true };
+    const projection = {
+      mainHeading: 1,
+      imageUrl: 1,
+      createdAt: 1,
+      introContent: 1,
+      paragraphFirst: 1,
+    };
+
+    const [total, list] = await Promise.all([
+      blogsCollection.countDocuments(filter),
+      blogsCollection
+        .find(filter, { projection })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(pageSize)
+        .toArray(),
+    ]);
+
+    const items = list.map((b) => ({
       id: b._id.toString(),
       title: b.mainHeading,
-      excerpt: buildPublicExcerpt(b),
+      excerpt: buildListCardExcerpt(b),
       imageUrl: b.imageUrl || null,
       createdAt: b.createdAt,
-      readTime: estimateReadTimeFromBlog(b),
+      readTime: estimateReadTimeFromListFields(b),
     }));
-    return res.json(out);
+
+    const hasMore = skip + list.length < total;
+
+    return res.json({ items, total, page, pageSize, hasMore });
   } catch (err) {
     console.error("Public blogs list error:", err);
     return res.status(500).json({ error: "Failed to load blogs." });
