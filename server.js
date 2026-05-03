@@ -25,6 +25,11 @@ const app = express();
 
 const PORT = process.env.PORT || 5000;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://quranacademy-nine.vercel.app";
+/** Comma-separated extra origins (e.g. Hostinger frontend: https://mysite.hostingersite.com). */
+const CORS_ORIGINS_EXTRA = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim().replace(/\/$/, ""))
+  .filter(Boolean);
 const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB = process.env.MONGODB_DB || "quranacademy";
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "aizaquranacademy@gmail.com";
@@ -127,6 +132,7 @@ const allowedOrigins = [
   "https://aizaquranacademy.com",
   "https://www.aizaquranacademy.com",
   CORS_ORIGIN,
+  ...CORS_ORIGINS_EXTRA,
 ].filter((v, i, a) => a.indexOf(v) === i);
 
 app.use(
