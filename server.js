@@ -24,12 +24,6 @@ if (process.env.MONGODB_SKIP_GOOGLE_DNS !== "1") {
 const app = express();
 
 const PORT = process.env.PORT || 5001;
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://quranacademy-nine.vercel.app";
-/** Comma-separated extra origins (e.g. Hostinger frontend: https://mysite.hostingersite.com). */
-const CORS_ORIGINS_EXTRA = (process.env.CORS_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim().replace(/\/$/, ""))
-  .filter(Boolean);
 const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB = process.env.MONGODB_DB || "quranacademy";
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "aizaquranacademy@gmail.com";
@@ -125,22 +119,29 @@ const blogUpload = multer({
   },
 });
 
-// CORS - must be before all routes
+// CORS - must be before all routes (dynamic origin; PATCH = admin blog publish)
 const allowedOrigins = [
-  "https://quranacademy-nine.vercel.app",
-  "http://localhost:3000",
   "https://aizaquranacademy.com",
   "https://www.aizaquranacademy.com",
-  CORS_ORIGIN,
-  ...CORS_ORIGINS_EXTRA,
-].filter((v, i, a) => a.indexOf(v) === i);
+  "http://localhost:3000",
+  "http://localhost:3001",
+];
 
-app.use(
-  cors({
-    origin: allowedOrigins,
-    credentials: true,
-  })
-);
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("CORS not allowed"));
+    }
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 app.use(express.json());
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
