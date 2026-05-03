@@ -63,6 +63,13 @@ async function connectMongo() {
     const db = mongoClient.db(MONGODB_DB);
     contactsCollection = db.collection("contacts");
     blogsCollection = db.collection("blog_posts");
+    try {
+      // Query: { published: true }.sort({ createdAt: -1 }) — yahi index use hota hai.
+      // (Aap ne jo `db.blogs` + `status` likha: yahan collection `blog_posts`, field `published` hai.)
+      await blogsCollection.createIndex({ published: 1, createdAt: -1 }, { background: true });
+    } catch (idxErr) {
+      console.warn("blog_posts index ensure:", idxErr?.message || idxErr);
+    }
     console.log("Connected to MongoDB:", MONGODB_DB);
     return true;
   } catch (err) {
@@ -358,67 +365,29 @@ app.delete("/api/blogs/:id", async (req, res) => {
   }
 });
 
-function buildPublicExcerpt(b) {
-  const legacyText = [b.paragraphFirst, b.paragraphSecond, b.heading2First, b.heading2Second]
-    .filter(Boolean)
-    .join(" ");
-  const subheadingText = Array.isArray(b.subheadings)
-    ? b.subheadings
-        .map((item) => `${item?.title || ""} ${item?.content || ""}`)
-        .join(" ")
-    : "";
-  const parts = [b.introContent, subheadingText, b.conclusion, legacyText]
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!parts) return b.mainHeading || "";
-  return parts.length > 200 ? `${parts.slice(0, 197)}…` : parts;
-}
-
-function estimateReadTimeFromBlog(b) {
-  const legacyText = [b.paragraphFirst, b.paragraphSecond, b.heading2First, b.heading2Second]
-    .filter(Boolean)
-    .join(" ");
-  const subheadingText = Array.isArray(b.subheadings)
-    ? b.subheadings
-        .map((item) => `${item?.title || ""} ${item?.content || ""}`)
-        .join(" ")
-    : "";
-  const text = [b.mainHeading, b.introContent, subheadingText, b.conclusion, legacyText]
-    .filter(Boolean)
-    .join(" ");
-  const words = text.split(/\s+/).filter(Boolean).length;
-  const mins = Math.max(1, Math.ceil(words / 200));
-  return `${mins} min read`;
-}
-
-/** List view: HTML strip + short excerpt (full body mat load karo). */
-function stripHtmlForList(s) {
-  return String(s || "")
+/** Public list: heading-only excerpt/readTime — DB se body fields load nahi. */
+function listCardExcerptFromHeading(mainHeading) {
+  const t = String(mainHeading || "")
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+  if (!t) return "";
+  return t.length > 200 ? `${t.slice(0, 197)}…` : t;
 }
 
-function buildListCardExcerpt(b) {
-  const intro = stripHtmlForList(b.introContent || b.paragraphFirst || "");
-  if (intro.length >= 30) {
-    return intro.length > 200 ? `${intro.slice(0, 197)}…` : intro;
-  }
-  const title = stripHtmlForList(b.mainHeading || "");
-  return title.length > 200 ? `${title.slice(0, 197)}…` : title || "";
+function listReadTimeFromHeading(mainHeading) {
+  const plain = String(mainHeading || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const words = plain.split(/\s+/).filter(Boolean).length;
+  return `${Math.max(1, Math.ceil(words / 200))} min read`;
 }
 
-function estimateReadTimeFromListFields(b) {
-  const intro = stripHtmlForList(b.introContent || b.paragraphFirst || "").slice(0, 4000);
-  const text = [b.mainHeading, intro].filter(Boolean).join(" ");
-  const words = text.split(/\s+/).filter(Boolean).length;
-  const mins = Math.max(1, Math.ceil(words / 200));
-  return `${mins} min read`;
-}
-
-/** Website / Blog.tsx — sirf published posts (projection + pagination = fast) */
+/**
+ * Website list — native `mongodb` driver (Mongoose nahi). `.toArray()` plain objects;
+ * `.lean()` sirf Mongoose par hota hai — yahan zarurat nahi.
+ */
 app.get("/api/public/blogs", async (req, res) => {
   try {
     const dbOk = await connectMongo();
@@ -427,7 +396,7 @@ app.get("/api/public/blogs", async (req, res) => {
     const skip = (page - 1) * pageSize;
 
     if (!dbOk || !blogsCollection) {
-      return res.json({ items: [], total: 0, page, pageSize, hasMore: false });
+      return res.json({ items: [], page, pageSize, hasMore: false });
     }
 
     const filter = { published: true };
@@ -435,32 +404,31 @@ app.get("/api/public/blogs", async (req, res) => {
       mainHeading: 1,
       imageUrl: 1,
       createdAt: 1,
-      introContent: 1,
-      paragraphFirst: 1,
+      slug: 1,
     };
 
-    const [total, list] = await Promise.all([
-      blogsCollection.countDocuments(filter),
-      blogsCollection
-        .find(filter, { projection })
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(pageSize)
-        .toArray(),
-    ]);
+    const fetchLimit = pageSize + 1;
+    const list = await blogsCollection
+      .find(filter, { projection })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(fetchLimit)
+      .toArray();
 
-    const items = list.map((b) => ({
+    const hasMore = list.length > pageSize;
+    const slice = hasMore ? list.slice(0, pageSize) : list;
+
+    const items = slice.map((b) => ({
       id: b._id.toString(),
+      slug: b.slug != null ? String(b.slug) : null,
       title: b.mainHeading,
-      excerpt: buildListCardExcerpt(b),
+      excerpt: listCardExcerptFromHeading(b.mainHeading),
       imageUrl: b.imageUrl || null,
       createdAt: b.createdAt,
-      readTime: estimateReadTimeFromListFields(b),
+      readTime: listReadTimeFromHeading(b.mainHeading),
     }));
 
-    const hasMore = skip + list.length < total;
-
-    return res.json({ items, total, page, pageSize, hasMore });
+    return res.json({ items, page, pageSize, hasMore });
   } catch (err) {
     console.error("Public blogs list error:", err);
     return res.status(500).json({ error: "Failed to load blogs." });
