@@ -8,6 +8,13 @@ const nodemailer = require("nodemailer");
 const multer = require("multer");
 const { MongoClient, ObjectId } = require("mongodb");
 const dns = require("dns");
+// Optional dep — agar `compression` install na ho to bhi server crash na ho
+let compression = null;
+try {
+  compression = require("compression");
+} catch {
+  /* npm install compression chalao to enable ho jayega */
+}
 
 dotenv.config();
 
@@ -144,8 +151,19 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
+if (compression) {
+  app.use(compression());
+}
+
 app.use(express.json());
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+app.use(
+  "/uploads",
+  express.static(path.join(__dirname, "uploads"), {
+    maxAge: "30d",
+    immutable: true,
+    etag: true,
+  })
+);
 
 app.get("/", (req, res) => {
   res.json({ ok: true, message: "Quran Academy backend is running" });
@@ -287,6 +305,7 @@ app.post("/api/blogs", (req, res, next) => {
     };
 
     const result = await blogsCollection.insertOne(doc);
+    invalidatePublicCaches();
     return res.json({ success: true, id: result.insertedId.toString(), imageUrl });
   } catch (err) {
     console.error("Blog save error:", err);
@@ -335,6 +354,8 @@ app.patch("/api/blogs/:id/publish", async (req, res) => {
     if (r.matchedCount === 0) {
       return res.status(404).json({ error: "Blog not found." });
     }
+    invalidatePublicCaches();
+    publicDetailCache.delete(id);
     return res.json({ success: true });
   } catch (err) {
     console.error("Blog publish error:", err);
@@ -366,6 +387,8 @@ app.delete("/api/blogs/:id", async (req, res) => {
       }
     }
     await blogsCollection.deleteOne({ _id: new ObjectId(id) });
+    invalidatePublicCaches();
+    publicDetailCache.delete(id);
     return res.json({ success: true });
   } catch (err) {
     console.error("Blog delete error:", err);
@@ -395,75 +418,278 @@ function listReadTimeFromHeading(mainHeading) {
 /**
  * Website list — native `mongodb` driver (Mongoose nahi). `.toArray()` plain objects;
  * `.lean()` sirf Mongoose par hota hai — yahan zarurat nahi.
+ *
+ * Speed:
+ *  - Aggregation $project se base64 imageUrl kabhi network/RAM tak nahi aata —
+ *    sirf check hota hai prefix "data:" hai ya nahi. Image bytes alag endpoint
+ *    `/api/public/blogs/:id/image` se long-cache headers ke saath aate hain.
+ *  - Chhota in-memory cache (TTL ~60s) MongoDB roundtrip aur cold-start latency
+ *    bachata hai jab same page baar baar khulta hai.
+ *  - Cache-Control: CDN/browser dono cache karein.
  */
+const PUBLIC_LIST_TTL_MS = 60 * 1000;
+const publicListCache = new Map(); // key -> { exp, body }
+
+function getCachedList(key) {
+  const hit = publicListCache.get(key);
+  if (!hit) return null;
+  if (hit.exp < Date.now()) {
+    publicListCache.delete(key);
+    return null;
+  }
+  return hit.body;
+}
+
+function setCachedList(key, body) {
+  if (publicListCache.size > 64) {
+    const oldestKey = publicListCache.keys().next().value;
+    if (oldestKey) publicListCache.delete(oldestKey);
+  }
+  publicListCache.set(key, { exp: Date.now() + PUBLIC_LIST_TTL_MS, body });
+}
+
+function invalidatePublicCaches() {
+  publicListCache.clear();
+}
+
 app.get("/api/public/blogs", async (req, res) => {
   try {
-    const dbOk = await connectMongo();
     const pageSize = Math.min(50, Math.max(1, parseInt(String(req.query.limit || "9"), 10) || 9));
     const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
     const skip = (page - 1) * pageSize;
 
+    const cacheKey = `list:p=${page}:s=${pageSize}`;
+    const cached = getCachedList(cacheKey);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=30, s-maxage=60, stale-while-revalidate=300");
+      res.setHeader("X-Cache", "HIT");
+      return res.json(cached);
+    }
+
+    const dbOk = await connectMongo();
     if (!dbOk || !blogsCollection) {
       return res.json({ items: [], page, pageSize, hasMore: false });
     }
 
-    const filter = { published: true };
-    const projection = {
-      mainHeading: 1,
-      imageUrl: 1,
-      createdAt: 1,
-      slug: 1,
-    };
-
     const fetchLimit = pageSize + 1;
+
+    /**
+     * Aggregation: imageUrl kabhi serialize ho ke client ya Node memory tak nahi aata
+     * agar wo data URL hai. Sirf "isInline" boolean aur (non-inline) URL aata hai.
+     */
     const list = await blogsCollection
-      .find(filter, { projection })
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(fetchLimit)
+      .aggregate(
+        [
+          { $match: { published: true } },
+          { $sort: { createdAt: -1 } },
+          { $skip: skip },
+          { $limit: fetchLimit },
+          {
+            $project: {
+              mainHeading: 1,
+              createdAt: 1,
+              slug: 1,
+              isInlineImage: {
+                $eq: [
+                  { $substrCP: [{ $ifNull: ["$imageUrl", ""] }, 0, 5] },
+                  "data:",
+                ],
+              },
+              imageUrlPlain: {
+                $cond: [
+                  {
+                    $eq: [
+                      { $substrCP: [{ $ifNull: ["$imageUrl", ""] }, 0, 5] },
+                      "data:",
+                    ],
+                  },
+                  null,
+                  { $ifNull: ["$imageUrl", null] },
+                ],
+              },
+            },
+          },
+        ],
+        { allowDiskUse: false }
+      )
       .toArray();
 
     const hasMore = list.length > pageSize;
     const slice = hasMore ? list.slice(0, pageSize) : list;
 
-    const items = slice.map((b) => ({
-      id: b._id.toString(),
-      slug: b.slug != null ? String(b.slug) : null,
-      title: b.mainHeading,
-      excerpt: listCardExcerptFromHeading(b.mainHeading),
-      imageUrl: b.imageUrl || null,
-      createdAt: b.createdAt,
-      readTime: listReadTimeFromHeading(b.mainHeading),
-    }));
+    const items = slice.map((b) => {
+      const id = b._id.toString();
+      // Inline image -> alag endpoint URL (browser independently load karega + long cache)
+      const imageUrl = b.isInlineImage
+        ? `/api/public/blogs/${id}/image`
+        : b.imageUrlPlain || null;
+      return {
+        id,
+        slug: b.slug != null ? String(b.slug) : null,
+        title: b.mainHeading,
+        excerpt: listCardExcerptFromHeading(b.mainHeading),
+        imageUrl,
+        createdAt: b.createdAt,
+        readTime: listReadTimeFromHeading(b.mainHeading),
+      };
+    });
 
-    return res.json({ items, page, pageSize, hasMore });
+    const body = { items, page, pageSize, hasMore };
+    setCachedList(cacheKey, body);
+
+    res.setHeader("Cache-Control", "public, max-age=30, s-maxage=60, stale-while-revalidate=300");
+    res.setHeader("X-Cache", "MISS");
+    return res.json(body);
   } catch (err) {
     console.error("Public blogs list error:", err);
     return res.status(500).json({ error: "Failed to load blogs." });
   }
 });
 
-/** Single published post (public detail page) */
-app.get("/api/public/blogs/:id", async (req, res) => {
+/**
+ * Image bytes endpoint — list me bheji gayi `/api/public/blogs/:id/image` URL.
+ * Data URL ko parse kar ke binary bhejta hai with long immutable cache —
+ * blog content rarely change hota hai, isliye 1 saal cache safe hai.
+ */
+app.get("/api/public/blogs/:id/image", async (req, res) => {
   try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).end();
+    }
     const dbOk = await connectMongo();
     if (!dbOk || !blogsCollection) {
-      return res.status(503).json({ error: "Database not available." });
+      return res.status(503).end();
     }
+    const b = await blogsCollection.findOne(
+      { _id: new ObjectId(id), published: true },
+      { projection: { imageUrl: 1 } }
+    );
+    if (!b || !b.imageUrl) {
+      return res.status(404).end();
+    }
+
+    const m = /^data:([^;]+);base64,(.+)$/.exec(b.imageUrl);
+    if (!m) {
+      // Disk-stored ya external URL — wahi follow karne do
+      const target = /^https?:\/\//i.test(b.imageUrl)
+        ? b.imageUrl
+        : b.imageUrl.startsWith("/")
+          ? b.imageUrl
+          : `/${b.imageUrl}`;
+      return res.redirect(302, target);
+    }
+
+    const mime = m[1] || "image/jpeg";
+    const buf = Buffer.from(m[2], "base64");
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Length", String(buf.length));
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.end(buf);
+  } catch (err) {
+    console.error("Blog image error:", err);
+    return res.status(500).end();
+  }
+});
+
+/** Single published post (public detail page) */
+const PUBLIC_DETAIL_TTL_MS = 5 * 60 * 1000;
+const publicDetailCache = new Map();
+
+function getCachedDetail(id) {
+  const hit = publicDetailCache.get(id);
+  if (!hit) return null;
+  if (hit.exp < Date.now()) {
+    publicDetailCache.delete(id);
+    return null;
+  }
+  return hit.body;
+}
+function setCachedDetail(id, body) {
+  if (publicDetailCache.size > 128) {
+    const oldestKey = publicDetailCache.keys().next().value;
+    if (oldestKey) publicDetailCache.delete(oldestKey);
+  }
+  publicDetailCache.set(id, { exp: Date.now() + PUBLIC_DETAIL_TTL_MS, body });
+}
+
+app.get("/api/public/blogs/:id", async (req, res) => {
+  try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ error: "Invalid id." });
     }
-    const b = await blogsCollection.findOne({ _id: new ObjectId(id), published: true });
+
+    const cached = getCachedDetail(id);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
+      res.setHeader("X-Cache", "HIT");
+      return res.json(cached);
+    }
+
+    const dbOk = await connectMongo();
+    if (!dbOk || !blogsCollection) {
+      return res.status(503).json({ error: "Database not available." });
+    }
+
+    /**
+     * Aggregation: detail mein full base64 imageUrl wapas bhejne ki zarurat nahi —
+     * frontend image ko alag URL se load kar sakta hai (lazy + cache).
+     */
+    const docs = await blogsCollection
+      .aggregate([
+        { $match: { _id: new ObjectId(id), published: true } },
+        { $limit: 1 },
+        {
+          $project: {
+            mainHeading: 1,
+            introContent: 1,
+            subheadings: 1,
+            conclusion: 1,
+            imageAltText: 1,
+            createdAt: 1,
+            heading2First: 1,
+            paragraphFirst: 1,
+            heading2Second: 1,
+            paragraphSecond: 1,
+            isInlineImage: {
+              $eq: [
+                { $substrCP: [{ $ifNull: ["$imageUrl", ""] }, 0, 5] },
+                "data:",
+              ],
+            },
+            imageUrlPlain: {
+              $cond: [
+                {
+                  $eq: [
+                    { $substrCP: [{ $ifNull: ["$imageUrl", ""] }, 0, 5] },
+                    "data:",
+                  ],
+                },
+                null,
+                { $ifNull: ["$imageUrl", null] },
+              ],
+            },
+          },
+        },
+      ])
+      .toArray();
+
+    const b = docs[0];
     if (!b) {
       return res.status(404).json({ error: "Not found." });
     }
+
     const fallbackSubheadings = [
       { title: b.heading2First || "", content: b.paragraphFirst || "" },
       { title: b.heading2Second || "", content: b.paragraphSecond || "" },
     ].filter((item) => item.title || item.content);
 
-    return res.json({
+    const imageUrl = b.isInlineImage
+      ? `/api/public/blogs/${b._id.toString()}/image`
+      : b.imageUrlPlain || null;
+
+    const body = {
       id: b._id.toString(),
       mainHeading: b.mainHeading,
       introContent: b.introContent || b.paragraphFirst || "",
@@ -478,9 +704,15 @@ app.get("/api/public/blogs/:id", async (req, res) => {
         : fallbackSubheadings,
       conclusion: b.conclusion || b.paragraphSecond || "",
       imageAltText: b.imageAltText || "",
-      imageUrl: b.imageUrl || null,
+      imageUrl,
       createdAt: b.createdAt,
-    });
+    };
+
+    setCachedDetail(id, body);
+
+    res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
+    res.setHeader("X-Cache", "MISS");
+    return res.json(body);
   } catch (err) {
     console.error("Public blog get error:", err);
     return res.status(500).json({ error: "Failed to load blog." });
