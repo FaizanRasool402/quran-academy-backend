@@ -323,18 +323,64 @@ app.get("/api/blogs", async (req, res) => {
           "Database not available. MongoDB connect nahi ho raha — pehle backend terminal me connection error fix karo.",
       });
     }
-    const list = await blogsCollection.find({}).sort({ createdAt: -1 }).toArray();
-    const out = list.map((b) => ({
-      id: b._id.toString(),
-      mainHeading: b.mainHeading,
-      imageUrl: b.imageUrl || null,
-      published: !!b.published,
-      createdAt: b.createdAt,
-    }));
+    // Projection: imageUrl field exclude karo — base64 images (up to 5 MB each) ko
+    // memory mein load karna server crash karta hai. Image alag endpoint se serve hogi.
+    const list = await blogsCollection
+      .find({}, { projection: { mainHeading: 1, published: 1, createdAt: 1, imageUrl: 1 } })
+      .sort({ createdAt: -1 })
+      .toArray();
+    const out = list.map((b) => {
+      const id = b._id.toString();
+      let imageUrl = b.imageUrl || null;
+      // base64 inline image ko lightweight endpoint URL se replace karo
+      if (imageUrl && imageUrl.startsWith("data:")) {
+        imageUrl = `/api/blogs/${id}/image`;
+      }
+      return {
+        id,
+        mainHeading: b.mainHeading,
+        imageUrl,
+        published: !!b.published,
+        createdAt: b.createdAt,
+      };
+    });
     return res.json(out);
   } catch (err) {
     console.error("Blog list error:", err);
     return res.status(500).json({ error: "Failed to load blogs." });
+  }
+});
+
+/** Admin image endpoint — published check nahi, draft blogs ki images bhi serve karta hai. */
+app.get("/api/blogs/:id/image", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return res.status(400).end();
+    const dbOk = await connectMongo();
+    if (!dbOk || !blogsCollection) return res.status(503).end();
+    const b = await blogsCollection.findOne(
+      { _id: new ObjectId(id) },
+      { projection: { imageUrl: 1 } }
+    );
+    if (!b || !b.imageUrl) return res.status(404).end();
+    const m = /^data:([^;]+);base64,(.+)$/.exec(b.imageUrl);
+    if (!m) {
+      const target = /^https?:\/\//i.test(b.imageUrl)
+        ? b.imageUrl
+        : b.imageUrl.startsWith("/")
+          ? b.imageUrl
+          : `/${b.imageUrl}`;
+      return res.redirect(302, target);
+    }
+    const mime = m[1] || "image/jpeg";
+    const buf = Buffer.from(m[2], "base64");
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Length", String(buf.length));
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.end(buf);
+  } catch (err) {
+    console.error("Admin blog image error:", err);
+    return res.status(500).end();
   }
 });
 
