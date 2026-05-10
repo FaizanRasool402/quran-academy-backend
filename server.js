@@ -131,6 +131,7 @@ const blogUpload = multer({
 const allowedOrigins = [
   "https://aizaquranacademy.com",
   "https://www.aizaquranacademy.com",
+  "https://api.aizaquranacademy.com",
   "http://localhost:3000",
   "http://localhost:3001",
 ];
